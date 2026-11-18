@@ -1,0 +1,515 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════
+#  zalaf_door.sh  v2.1 — مديرُ جلساتٍ مؤقّتة لعدّة وكلاء
+# ═══════════════════════════════════════════════════════════════════════════
+#  فكرة العمل: لكلّ وكيلٍ «كرسيّ» (seat) = مفتاحٌ + مسارٌ + سياسة + مدّة.
+#  كلُّ كرسيّ سطرٌ واحد في authorized_keys بوسمٍ خاصّ به:
+#
+#      zalaf-door-<الاسم>-<14 رقمًا>
+#
+#  والحذفُ **بالوسم فقط** — لا بالبلوب أبدًا. فيستحيل أن يمسّ حذفُ كرسيّ
+#  سطرَ NOVA (`nova-agent-…`) أو سطرَ `zalaf-agent-20261116` ولا مفتاح المالك.
+#
+#  ── الأساسيّ ─────────────────────────────────────────────────────────────
+#    sudo bash zalaf_door.sh                       # لوحة تفاعلية
+#    sudo bash zalaf_door.sh open  -a arena -m 120 -w
+#    sudo bash zalaf_door.sh list
+#    sudo bash zalaf_door.sh close -a arena [--dry-run]
+#    sudo bash zalaf_door.sh close --all [--dry-run]
+#    sudo bash zalaf_door.sh status -a arena | log -a arena [--follow]
+#    sudo bash zalaf_door.sh agents | agent-add | agent-del | doctor
+#
+#  ── خيارات open ──────────────────────────────────────────────────────────
+#    -a|--agent NAME     الكرسيّ
+#    -m|--minutes N      المدّة ٥..١٤٤٠ (افتراضي ١٢٠)
+#    -p|--path DIR       مجلّد العمل (يُستعمل cd عند الدخول مع --wrap)
+#    -r|--restricted     تقييد كامل: بلا pty ولا توجيه (أوامر فقط)
+#    --no-sftp --no-pty  تقييدات إضافية
+#    -w|--wrap           تسجيل كل أمر في سجلّ الوكيل
+#    -g|--guard          حارس يحذف السطر عند الانتهاء
+#    --key FILE.pub      مفتاح عامّ من ملف     --pubkey "ssh-ed25519 …" نصًّا
+#    --label TEXT        وسم حرّ                --force  أعد الفتح
+#    -y|--yes            بلا سؤال
+#
+#  ── الكراسي المسجّلة ─────────────────────────────────────────────────────
+#    arena  ← أنا (Arena.ai)          nova ← وكيل NOVA   guest ← يُسأل عند الطلب
+# ═══════════════════════════════════════════════════════════════════════════
+set -uo pipefail
+VERSION="2.1"
+
+# ── مسارات (ZALAF_DOOR_* للاختبار فقط) ─────────────────────────────────────
+RUN_DIR="${ZALAF_DOOR_RUNDIR:-/root/zalaf.net/run}"
+KEYFILE="${ZALAF_DOOR_KEYFILE:-/root/.ssh/authorized_keys}"
+REGISTRY="$RUN_DIR/agents.registry"
+SESSIONS="$RUN_DIR/sessions.dat"
+JOURNAL="$RUN_DIR/door.log"
+TORNDIR="$RUN_DIR/audit"
+
+# ── ما لا يُلمس أبدًا ──────────────────────────────────────────────────────
+SEAT_TAG="zalaf-door"                 # وسم أسطرنا: zalaf-door-<name>-<ts14>
+NOVA_PATTERN=" nova-agent-"
+ZALAF_FIXED_TAG="zalaf-agent-20261116"
+PROTECTED_LOGS="/root/nova_agent_audit.log /root/nova_agent_history.log"
+
+# ── لون ────────────────────────────────────────────────────────────────────
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[36m'; C_D=$'\e[2m'; C_0=$'\e[0m'
+else C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_0=""; fi
+ok()  { printf '%s✓%s %s\n' "$C_G" "$C_0" "$*"; }
+warn(){ printf '%s!%s %s\n' "$C_Y" "$C_0" "$*"; }
+err() { printf '%s✗%s %s\n' "$C_R" "$C_0" "$*" >&2; }
+hdr() { printf '%s══ %s ══%s\n' "$C_B" "$*" "$C_0"; }
+dim() { printf '%s%s%s\n' "$C_D" "$*" "$C_0"; }
+stamp(){ date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+die() { err "$*"; exit 1; }
+mkdir -p "$RUN_DIR" 2>/dev/null || true
+require_run_dir(){  # لا نُكمل بعمى إن لم نستطع الكتابة (نسيان sudo)
+  if [ ! -d "$RUN_DIR" ] || [ ! -w "$RUN_DIR" ]; then
+    err "لا أستطيع الكتابة في $RUN_DIR"
+    dim "   شغّل الأمر بـ sudo، أو اضبط ZALAF_DOOR_RUNDIR إلى مجلّدٍ تملكه (للاختبار فقط)." >&2
+    exit 1
+  fi
+}
+note() { local l; l="$(stamp) $*"
+  { printf '%s\n' "$l" >> "$JOURNAL"; } 2>/dev/null || true
+  chmod 600 "$JOURNAL" 2>/dev/null || true
+  command -v logger >/dev/null 2>&1 && logger -t zalaf-door "$*" 2>/dev/null
+  return 0; }
+
+# ── أدوات ──────────────────────────────────────────────────────────────────
+cnt(){ [ -f "$1" ] || { echo 0; return; }; local n; n=$(grep "$2" -- "$3" "$1" 2>/dev/null); printf '%s\n' "${n:-0}" | tail -1; }
+is_num(){ case "${1:-}" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+blob_of(){ awk '{for(i=1;i<=NF;i++) if($i ~ /^ssh-(ed25519|rsa|dss)$/ || $i ~ /^ecdsa-sha2-/ || $i ~ /^sk-ssh-/) {print $(i+1); exit}}' <<<"$1"; }
+fp_of_blob(){ local t="$RUN_DIR/.fp.tmp"; printf 'ssh-ed25519 %s k\n' "$1" > "$t" 2>/dev/null || return 1
+  ssh-keygen -lf "$t" 2>/dev/null | awk '{print $2}'; rm -f "$t"; }
+exp_epoch(){  # "20261118093528Z" → ثواني يونكس (بلا الاعتماد على صيغة date)
+  local e="$1" y mo d h mi se
+  # الصيغة YYYYMMDDHHMMSSZ (بلا حرف T) ⇒ الساعة تبدأ من الفهرس ٨
+  y=${e:0:4}; mo=${e:4:2}; d=${e:6:2}; h=${e:8:2}; mi=${e:10:2}; se=${e:12:2}
+  case "$y$mo$d$h$mi$se" in ''|*[!0-9]*) echo ""; return;; esac
+  date -u -d "${y}-${mo}-${d} ${h}:${mi}:${se}" +%s 2>/dev/null
+}
+seat_regex(){ printf ' %s-%s-[0-9]{14}$' "$SEAT_TAG" "$1"; }   # لحذف كرسيّ محدّد
+seat_regex_any(){ printf ' %s-[A-Za-z0-9_]+-[0-9]{14}$' "$SEAT_TAG"; }
+
+# ── السجلّ ─────────────────────────────────────────────────────────────────
+seed_registry() {
+  [ -f "$REGISTRY" ] && return 0
+  cat > "$REGISTRY" <<'REG'
+# name|type|blob|path|policy|comment
+arena|key|AAAAC3NzaC1lZDI1NTE5AAAAIEJEfahsW+CSLFAMHxL39UktfDrWCxcwbhsaiok7dXAi|/root/zalaf.net|rw|Arena.ai agent — SHA256:ynsqx2Ne/oFG…pFIM
+nova|key|AAAAC3NzaC1lZDI1NTE5AAAAIJTnfkKMkquEJ7yPb6TepAi0moSfqQyJWmpLP4vCc0nb|/root/NOVA|rw|NOVA agent key من door.sh — SHA256:resJN3cv…H2V4
+guest|prompt||/|rw|كرسيّ عامّ: يُسأل عن المفتاح عند الفتح
+REG
+  chmod 600 "$REGISTRY" 2>/dev/null || true
+}
+agents_list(){ grep -v '^[[:space:]]*#' "$REGISTRY" 2>/dev/null | grep -v '^[[:space:]]*$'; }
+agent_row(){ agents_list | awk -F'|' -v n="$1" '$1==n{print; exit}'; }
+agent_exists(){ [ -n "$(agent_row "$1")" ]; }
+agent_field(){ agent_row "$1" | awk -F'|' -v f="$2" '{print $f}'; }
+
+# ── الحالة ─────────────────────────────────────────────────────────────────
+session_row(){ [ -f "$SESSIONS" ] || return 1; awk -F'|' -v n="$1" '$1==n{print; exit}' "$SESSIONS"; }
+session_exists(){ [ -n "$(session_row "$1")" ]; }
+session_set(){ touch "$SESSIONS"; chmod 600 "$SESSIONS" 2>/dev/null || true
+  grep -v "^$1|" "$SESSIONS" > "$SESSIONS.tmp" 2>/dev/null || true
+  printf '%s\n' "$2" >> "$SESSIONS.tmp"; mv "$SESSIONS.tmp" "$SESSIONS"; }
+session_del(){ [ -f "$SESSIONS" ] || return 0
+  grep -v "^$1|" "$SESSIONS" > "$SESSIONS.tmp" 2>/dev/null || true; mv "$SESSIONS.tmp" "$SESSIONS"; }
+
+# ── من يملك السطر؟ ─────────────────────────────────────────────────────────
+line_owner(){
+  local l="$1" b n
+  grep -qF "$NOVA_PATTERN" <<<"$l" && { echo "nova"; return; }
+  grep -qF " $ZALAF_FIXED_TAG" <<<"$l" && { echo "zalaf-fixed"; return; }
+  if grep -qE "$(seat_regex_any)" <<<"$l"; then
+    n=$(sed -E 's/.*zalaf-door-([A-Za-z0-9_]+)-[0-9]{14}$/\1/' <<<"$l"); echo "seat:$n"; return
+  fi
+  grep -qE '^(ssh-|command=|no-port-forwarding|restrict|from=)' <<<"$l" && { echo owner; return; }
+  echo unknown
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  agents
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_agents(){
+  seed_registry; hdr "الكراسي المسجّلة"
+  agents_list | while IFS='|' read -r n t b p pol c; do
+    local fp="—"; [ -n "${b:-}" ] && fp=$(fp_of_blob "$b")
+    local live=""; session_exists "$n" && live="  ${C_G}●جلسة قائمة${C_0}"
+    printf '  %s%-10s%s  %-34s %s%s\n' "$C_B" "$n" "$C_0" "${p:-—}" "${pol:-rw}" "$live"
+    printf '   %-30s %s\n' "البصمة" "$fp"
+    [ -n "${c:-}" ] && dim "   $c"
+  done
+  echo; dim "  agent-add NAME --key FILE.pub [-p DIR] [-r]   ·   agent-del NAME"
+}
+
+cmd_agent_add(){
+  local name="${1:-}"; [ -n "$name" ] || die "الاسم مطلوب"
+  shift || true
+  local pubfile="" pubkey="" path="/" policy="rw" comment=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --key) pubfile="$2"; shift 2;; --pubkey) pubkey="$2"; shift 2;;
+    -p|--path) path="$2"; shift 2;; -r|--read-only|--restricted) policy="restricted"; shift;;
+    -c|--comment) comment="$2"; shift 2;; *) die "خيار غير معروف: $1";;
+  esac; done
+  case "$name" in *[!A-Za-z0-9_]*) die "الاسم: حروف إنكليزية وأرقام و_ فقط";; esac
+  agent_exists "$name" && die "الكرسيّ '$name' موجود — احذفه: agent-del $name"
+  local blob=""
+  if [ -n "$pubfile" ]; then [ -f "$pubfile" ] || die "لا ملف: $pubfile"
+    blob=$(blob_of "$(cat "$pubfile")"); comment="${comment:-$(awk '{print $NF}' "$pubfile")}"
+  elif [ -n "$pubkey" ]; then blob=$(blob_of "$pubkey"); fi
+  seed_registry
+  printf '%s|%s|%s|%s|%s|%s\n' "$name" "$([ -n "$blob" ] && echo key || echo prompt)" "$blob" "$path" "$policy" "${comment:-أُضيف $(stamp)}" >> "$REGISTRY"
+  ok "أُضيف الكرسيّ '$name' — المسار $path · السياسة $policy"
+  [ -n "$blob" ] && dim "   البصمة: $(fp_of_blob "$blob")"
+}
+
+cmd_agent_del(){
+  local name="${1:-}"; [ -n "$name" ] || die "الاسم مطلوب"
+  agent_exists "$name" || die "لا كرسيّ بهذا الاسم: $name"
+  session_exists "$name" && { warn "للوكيل جلسة قائمة — سأغلقها."; cmd_close -a "$name" >/dev/null 2>&1 || true; }
+  grep -v "^$name|" "$REGISTRY" > "$REGISTRY.tmp" && mv "$REGISTRY.tmp" "$REGISTRY"
+  ok "حُذف '$name' من السجلّ (authorized_keys لم يُمسّ)."
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  open
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_open(){
+  local name="arena" minutes=120 path="" policy="" wrap=0 guard=0 force=0
+  local keyfile_override="" pubkey_override="" label="" NO_SFTP=0 NO_PTY=0
+  while [ $# -gt 0 ]; do case "$1" in
+    -a|--agent) name="$2"; shift 2;; -m|--minutes) minutes="$2"; shift 2;;
+    -p|--path) path="$2"; shift 2;;
+    -r|--restricted|--read-only) policy="restricted"; shift;;
+    --rw) policy="rw"; shift;;
+    -w|--wrap) wrap=1; shift;; -g|--guard) guard=1; shift;;
+    --force) force=1; shift;;
+    --key) keyfile_override="$2"; shift 2;; --pubkey) pubkey_override="$2"; shift 2;;
+    --label) label="$2"; shift 2;;
+    --no-sftp) NO_SFTP=1; shift;; --no-pty) NO_PTY=1; shift;;
+    -y|--yes) shift;;
+    -h|--help) usage; exit 0;;
+    *) die "خيار غير معروف: $1";;
+  esac; done
+
+  case "$name" in *[!A-Za-z0-9_]*) die "اسم الكرسيّ غير صالح: $name";; esac
+  is_num "$minutes" || die "المدّة أرقام فقط"
+  [ "$minutes" -ge 5 ] && [ "$minutes" -le 1440 ] || die "المدّة بين ٥ و١٤٤٠ دقيقة"
+
+  seed_registry
+  local blob="" regpath="/" regpol="rw"
+  if agent_exists "$name"; then
+    blob=$(agent_field "$name" 3); regpath=$(agent_field "$name" 4); regpol=$(agent_field "$name" 5)
+  fi
+  [ -n "$keyfile_override" ] && { [ -f "$keyfile_override" ] || die "لا ملف: $keyfile_override"; blob=$(blob_of "$(cat "$keyfile_override")"); }
+  [ -n "$pubkey_override" ] && blob=$(blob_of "$pubkey_override")
+  [ -z "$blob" ] && die "لا مفتاح للكرسيّ '$name' — مرّر --key FILE.pub أو --pubkey \"ssh-ed25519 …\"، أو سجّله بـ agent-add."
+
+  path="${path:-$regpath}"; policy="${policy:-$regpol}"
+  [ -d "$path" ] || warn "المسار غير موجود الآن: $path"
+
+  if session_exists "$name"; then
+    if [ "$force" -eq 1 ]; then warn "للوكيل '$name' جلسة قائمة — تُغلق وتُفتح أخرى."
+      cmd_close -a "$name" >/dev/null 2>&1 || true
+    else die "للوكيل '$name' جلسة قائمة. --force لإعادة الفتح أو close -a $name"; fi
+  fi
+
+  mkdir -p "$(dirname "$KEYFILE")" && chmod 700 "$(dirname "$KEYFILE")" 2>/dev/null || true
+  mkdir -p "$RUN_DIR"; touch "$KEYFILE"; chmod 600 "$KEYFILE"
+  local bak="$RUN_DIR/authorized_keys.bak.open-$name.$(stamp | tr -d ':')"
+  cp -a "$KEYFILE" "$bak" 2>/dev/null || die "تعذّر النسخ الاحتياطي — لم أعدّل شيئًا."
+
+  # ── سياسات ──
+  local opts="no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-user-rc"
+  [ "$NO_SFTP" -eq 1 ] && opts="$opts,no-sftp"
+  [ "$NO_PTY" -eq 1 ] && opts="$opts,no-pty"
+  [ "$policy" = "restricted" ] && opts="$opts,restrict"
+
+  local exp; exp=$(date -u -d "+${minutes} minutes" +%Y%m%d%H%M%SZ 2>/dev/null) \
+    || exp=$(date -u -v+"${minutes}"M +%Y%m%d%H%M%SZ 2>/dev/null) || die "تعذّر حساب وقت الانتهاء."
+  local tag="${SEAT_TAG}-${name}-$(date -u +%Y%m%d%H%M%S)"
+
+  # ── غلاف التدقيق ──
+  local cmdopt=""
+  if [ "$wrap" -eq 1 ]; then
+    local w="$RUN_DIR/wrap.$name.sh"
+    cat > "$w" <<WRAPEOF
+#!/bin/sh
+# غلاف تدقيق الكرسيّ '$name' — سجلّه وحده، لا سجلّات NOVA
+LOG="$TORNDIR/$name.log"; umask 077; [ -d "$TORNDIR" ] || mkdir -p "$TORNDIR" 2>/dev/null
+ts(){ date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+say(){ printf '%s %s\n' "\$(ts)" "\$*" >> "\$LOG" 2>/dev/null
+       command -v logger >/dev/null 2>&1 && logger -t zalaf-door-$name "\$*" 2>/dev/null; return 0; }
+say "SESSION start sid=\$\$ src=\${SSH_CONNECTION%% *} path='$path'"
+cd '$path' 2>/dev/null || true
+if [ -n "\${SSH_ORIGINAL_COMMAND:-}" ]; then
+  say "CMD exec :: \$SSH_ORIGINAL_COMMAND"
+  sh -c "\$SSH_ORIGINAL_COMMAND"; rc=\$?; say "CMD done rc=\$rc"; exit \$rc
+fi
+"\${SHELL:-/bin/bash}" -il; rc=\$?; say "SESSION end rc=\$rc"; exit \$rc
+WRAPEOF
+    chmod 755 "$w"
+    if sh -n "$w" 2>/dev/null; then cmdopt=",command=\"$w\""; ok "غلاف التدقيق: $w"
+    else rm -f "$w"; warn "تعذّر إنشاء الغلاف — بلا تدقيق هذه الجلسة."; fi
+  fi
+
+  # ── احذف أسطر هذا الكرسيّ وحدها (بالوسم) ثم أضف سطرًا واحدًا ──
+  grep -vE "$(seat_regex "$name")" "$KEYFILE" > "$KEYFILE.tmp" || true
+  mv "$KEYFILE.tmp" "$KEYFILE"; chmod 600 "$KEYFILE"
+  printf '%s\n' "${opts}${cmdopt},expiry-time=\"${exp}\" ssh-ed25519 ${blob} ${tag}" >> "$KEYFILE"
+  chmod 600 "$KEYFILE"
+
+  # ── فحص أمان: كل ما هو ليس سطر الكرسيّ يجب أن يبقى حرفيًّا ──
+  local nova_n zalaf_n before_nova before_zalaf other_changed
+  before_nova=$(cnt "$bak" -cE "$NOVA_PATTERN"); before_zalaf=$(cnt "$bak" -cF " $ZALAF_FIXED_TAG")
+  nova_n=$(cnt "$KEYFILE" -cE "$NOVA_PATTERN");   zalaf_n=$(cnt "$KEYFILE" -cF " $ZALAF_FIXED_TAG")
+  # المقارنة بالوسم لا بالبلوب: فقد يكون للوكيل مفتاحٌ موجود أيضًا في سطر محميّ (NOVA)
+  other_changed=$(
+    diff <(grep -vE "$(seat_regex "$name")" "$bak" 2>/dev/null) \
+         <(grep -vF " $tag" "$KEYFILE" 2>/dev/null) >/dev/null 2>&1 && echo no || echo yes
+  )
+  if [ "$nova_n" != "$before_nova" ] || [ "$zalaf_n" != "$before_zalaf" ] || [ "$other_changed" = "yes" ]; then
+    cp -a "$bak" "$KEYFILE"; chmod 600 "$KEYFILE"
+    die "فحص الأمان فشل (NOVA $before_nova→$nova_n · ZALAF $before_zalaf→$zalaf_n · أخرى:$other_changed) — استُعيد الملفّ، لم يتغيّر شيء."
+  fi
+
+  session_set "$name" "$name|$tag|$exp|$(stamp)|$blob|$path|$policy|$wrap|$guard|$label"
+  note "OPEN  seat=$name tag=$tag min=$minutes exp=$exp path=$path policy=$policy wrap=$wrap guard=$guard"
+
+  if [ "$guard" -eq 1 ]; then
+    if command -v systemd-run >/dev/null 2>&1 && \
+       systemd-run --on-active="${minutes}m" --unit="zalaf-door-$name-$(date +%s)" \
+         "$0" close -a "$name" >/dev/null 2>&1; then
+      ok "حارس systemd-run بعد $minutes دقيقة"; note "GUARD seat=$name systemd-run"
+    else
+      nohup sh -c "sleep $((minutes*60)); '$0' close -a '$name'" >/dev/null 2>&1 &
+      ok "حارس sleep بعد $minutes دقيقة"; note "GUARD seat=$name sleep"
+    fi
+  fi
+
+  echo; hdr "الكرسيّ '$name' مفتوح — $minutes دقيقة"
+  printf '  %-14s %s\n' "الوسم"        "$tag"
+  printf '  %-14s %s (UTC)\n' "ينتهي"   "$exp"
+  printf '  %-14s %s\n' "المسار"       "$path"
+  printf '  %-14s %s%s\n' "السياسة"    "$policy" "$([ "$wrap" -eq 1 ] && echo ' + تدقيق')"
+  printf '  %-14s %s\n' "البصمة"       "$(fp_of_blob "$blob")"
+  printf '  %-14s %s\n' "احتياطي"      "$bak"
+  echo; dim "  list · status -a $name · log -a $name · close -a $name"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  close
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_close(){
+  local name="" all=0 dry=0
+  while [ $# -gt 0 ]; do case "$1" in
+    -a|--agent) name="$2"; shift 2;; --all) all=1; shift;;
+    --dry-run) dry=1; shift;; -y|--yes) shift;;
+    *) die "خيار غير معروف: $1";;
+  esac; done
+  [ "$all" -eq 1 ] && name="@all"
+  [ -n "$name" ] || die "حدّد: close -a NAME  أو  close --all"
+
+  [ -f "$KEYFILE" ] || { warn "لا ملف مفاتيح — لا شيء لإغلاقه."; return 0; }
+  local re; if [ "$name" = "@all" ]; then re=$(seat_regex_any); else re=$(seat_regex "$name"); fi
+
+  local before_nova before_zalaf
+  before_nova=$(cnt "$KEYFILE" -cE "$NOVA_PATTERN"); before_zalaf=$(cnt "$KEYFILE" -cF " $ZALAF_FIXED_TAG")
+  local bak="$RUN_DIR/authorized_keys.bak.close-${name//@/}.$(stamp | tr -d ':')"
+  cp -a "$KEYFILE" "$bak" 2>/dev/null || die "تعذّر النسخ الاحتياطي — لم أحذف شيئًا."
+
+  hdr "أسطر ستُحذف ($name)"
+  local n=0
+  while IFS= read -r l; do [ -z "$l" ] && continue
+    if grep -qE "$re" <<<"$l"; then n=$((n+1)); printf '  %s\n' "$l" | cut -c1-110; fi
+  done < "$KEYFILE"
+  [ "$n" -eq 0 ] && dim "  (لا شيء)"
+  [ "$dry" -eq 1 ] && { echo; ok "dry-run: لم يُحذف شيء."; dim "  نسخة احتياطية: $bak"; return 0; }
+
+  grep -vE "$re" "$KEYFILE" > "$KEYFILE.tmp" || true
+  local after_nova after_zalaf
+  after_nova=$(cnt "$KEYFILE.tmp" -cE "$NOVA_PATTERN"); after_zalaf=$(cnt "$KEYFILE.tmp" -cF " $ZALAF_FIXED_TAG")
+  local other_changed
+  other_changed=$(diff <(grep -vE "$re" "$KEYFILE") <(cat "$KEYFILE.tmp") >/dev/null 2>&1 && echo no || echo yes)
+  if [ "$after_nova" != "$before_nova" ] || [ "$after_zalaf" != "$before_zalaf" ] || [ "$other_changed" = "yes" ]; then
+    rm -f "$KEYFILE.tmp"
+    die "فحص الأمان فشل (NOVA $before_nova→$after_nova · ZALAF $before_zalaf→$after_zalaf) — لم يُحذف شيء."
+  fi
+  mv "$KEYFILE.tmp" "$KEYFILE"; chmod 600 "$KEYFILE"
+
+  if [ "$name" = "@all" ]; then : > "$SESSIONS"
+  else session_del "$name"; fi
+  note "CLOSE seat=$name lines=$n nova=kept zalaf=kept"
+  ok "أُغلق '$name' — حُذف $n سطرًا."
+  printf '  NOVA بقيت: %s · ZALAF الثابت: %s\n' "$after_nova" "$after_zalaf"
+  printf '  احتياطي: %s\n  سجلّات الوكلاء: %s\n' "$bak" "$TORNDIR"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  list / status / log / doctor
+# ═══════════════════════════════════════════════════════════════════════════
+cmd_list(){
+  hdr "الجلسات القائمة"
+  if [ ! -s "$SESSIONS" ]; then dim "  (لا جلسات)"; else
+    while IFS='|' read -r n tag exp opened blob path policy wrap guard label; do
+      [ -z "${n:-}" ] && continue
+      local mark="${C_G}●${C_0}" remaining="—"
+      grep -qF "$blob" "$KEYFILE" 2>/dev/null || mark="${C_R}✗${C_0}"
+      if [ -n "${exp:-}" ]; then
+        local e; e=$(exp_epoch "$exp")
+        if [ -n "${e:-}" ] && [ "$e" -gt 0 ] 2>/dev/null; then
+          local d=$(( (e - $(date +%s)) / 60 ))
+          if [ "$d" -lt 0 ]; then remaining="${C_R}انتهت${C_0}"; else remaining="$d دقيقة"; fi
+        fi
+      fi
+      printf '  %s %s%-10s%s  تنتهي بعد %-12s %s\n' "$mark" "$C_B" "$n" "$C_0" "$remaining" "${path:-—}"
+      dim "     tag=$tag · policy=$policy · wrap=$wrap guard=$guard${label:+ · $label}"
+    done < "$SESSIONS"
+  fi
+  echo
+  dim "  authorized_keys: $(cnt "$KEYFILE" -c . "") سطرًا · NOVA: $(cnt "$KEYFILE" -cE "$NOVA_PATTERN") (محميّ) · ZALAF الثابت: $(cnt "$KEYFILE" -cF " $ZALAF_FIXED_TAG") (محميّ) · أسطر الباب: $(cnt "$KEYFILE" -cE "$(seat_regex_any)")"
+}
+
+cmd_status(){
+  local name=""
+  while [ $# -gt 0 ]; do case "$1" in -a|--agent) name="$2"; shift 2;; *) shift;; esac; done
+  if [ -n "$name" ]; then
+    hdr "الكرسيّ '$name'"
+    if session_exists "$name"; then
+      IFS='|' read -r _ tag exp opened blob path policy wrap guard label <<<"$(session_row "$name")"
+      printf '  %-10s %s\n' "الوسم" "$tag"; printf '  %-10s %s\n' "ينتهي" "$exp"
+      printf '  %-10s %s\n' "المسار" "$path";  printf '  %-10s %s\n' "السياسة" "$policy"
+      printf '  %-10s %s\n' "تدقيق" "$wrap · حارس $guard"
+      printf '  %-10s %s سطر\n' "في الملفّ" "$(cnt "$KEYFILE" -cF "$tag")"
+      [ -f "$TORNDIR/$name.log" ] && printf '  %-10s %s (%s سطر)\n' "السجل" "$TORNDIR/$name.log" "$(wc -l < "$TORNDIR/$name.log")"
+    else warn "لا جلسة قائمة للكرسيّ '$name'"; fi
+    return 0
+  fi
+  hdr "حالة الباب"
+  printf '  %-18s %s\n' "ملف المفاتيح" "$KEYFILE ($(stat -c '%U %a' "$KEYFILE" 2>/dev/null || echo '؟'))"
+  printf '  %-18s %s\n' "أسطر NOVA" "$(cnt "$KEYFILE" -cE "$NOVA_PATTERN")  (محميّة)"
+  printf '  %-18s %s\n' "ZALAF الثابت" "$(cnt "$KEYFILE" -cF " $ZALAF_FIXED_TAG")  (محميّ)"
+  printf '  %-18s %s\n' "أسطر الباب" "$(cnt "$KEYFILE" -cE "$(seat_regex_any)")"
+  echo; cmd_list
+}
+
+cmd_log(){
+  local name="" follow=0 tailn=200
+  while [ $# -gt 0 ]; do case "$1" in
+    -a|--agent) name="$2"; shift 2;; -f|--follow) follow=1; shift;; -n) tailn="$2"; shift 2;; *) shift;;
+  esac; done
+  if [ -z "$name" ]; then hdr "سجلّ الباب"; [ -f "$JOURNAL" ] && tail -n "$tailn" "$JOURNAL" || dim "  (لا سجلّ بعد)"; return 0; fi
+  local f="$TORNDIR/$name.log"
+  [ -f "$f" ] || { warn "لا سجلّ للكرسيّ '$name'"; dim "  أضف --wrap عند الفتح."; return 0; }
+  hdr "سجلّ '$name'"; [ "$follow" -eq 1 ] && tail -f "$f" || tail -n "$tailn" "$f"
+}
+
+cmd_doctor(){
+  hdr "فحص البيئة"
+  for b in sshd ssh-keygen date systemd-run nohup logger; do
+    if command -v "$b" >/dev/null 2>&1; then printf '  %s✓%s %-12s %s\n' "$C_G" "$C_0" "$b" "$(command -v "$b")"
+    else printf '  %s!%s %-12s %s\n' "$C_Y" "$C_0" "$b" "غير موجود"; fi
+  done
+  echo
+  printf '  %-18s %s\n' "المجلّد" "$RUN_DIR"
+  printf '  %-18s %s\n' "الملك/الصلاحية" "$(stat -c '%U:%a' "$KEYFILE" 2>/dev/null || echo '؟')"
+  if command -v sshd >/dev/null 2>&1; then
+    echo; hdr "sshd -T (قراءة فقط)"
+    sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|pubkeyauthentication|passwordauthentication|authorizedkeysfile|strictmodes|pubkeyacceptedalgorithms)' || warn "تعذّر قراءة sshd -T"
+  fi
+  echo; cmd_list
+}
+
+usage(){
+cat <<'USAGE'
+zalaf_door.sh v2.1 — مدير جلسات مؤقّتة لعدّة وكلاء
+
+  bash zalaf_door.sh                     لوحة تفاعلية
+  open  -a NAME [-m N] [-p DIR] [-r] [-w] [-g] [--force]
+  close -a NAME [--dry-run]  |  close --all [--dry-run]
+  list | status [-a NAME] | log [-a NAME] [--follow]
+  agents | agent-add NAME --key FILE.pub [-p DIR] [-r] | agent-del NAME | doctor
+
+خيارات open: -m المدّة(٥..١٤٤٠) · -p المسار · -r تقييد كامل (بلا pty) ·
+  --no-sftp --no-pty · -w تسجيل كل أمر · -g حارس إغلاق تلقائي ·
+  --key FILE.pub | --pubkey "ssh-ed25519 …" · --label TEXT · --force · -y
+
+وسم كل كرسيّ: zalaf-door-<الاسم>-<طابع زمني 14 رقمًا>
+الحذف بالوسم فقط ⇒ لا يمسّ nova-agent-… ولا zalaf-agent-20261116 ولا مفتاح المالك.
+كل عملية: نسخة احتياطية قبلها + فحص أمان بعدها يُعيد الملفّ إن تغيّر شيء غريب.
+USAGE
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  القائمة التفاعلية
+# ═══════════════════════════════════════════════════════════════════════════
+pause(){ printf '\n%s— اضغط Enter —%s' "$C_D" "$C_0"; read -r _ || true; }
+
+menu(){
+  seed_registry
+  while :; do
+    clear 2>/dev/null || true
+    echo; hdr "zalaf_door v$VERSION"
+    printf '  %s1%s فتح كرسيّ      %s4%s سجلّ كرسيّ\n' "$C_B" "$C_0" "$C_B" "$C_0"
+    printf '  %s2%s إغلاق كرسيّ    %s5%s الكراسي / إضافة كرسيّ\n' "$C_B" "$C_0" "$C_B" "$C_0"
+    printf '  %s3%s عرض الجلسات    %s6%s فحص البيئة\n' "$C_B" "$C_0" "$C_B" "$C_0"
+    printf '  %s0%s خروج\n' "$C_B" "$C_0"
+    printf '\nاختر: '; read -r c || exit 0
+    case "$c" in
+      1) local a m p pol w g
+         echo "الكراسي: $(agents_list | cut -d'|' -f1 | tr '\n' ' ')"
+         printf 'الاسم [arena]: '; read -r a; a=${a:-arena}
+         printf 'الدقائق [120]: '; read -r m; m=${m:-120}
+         printf 'المسار (Enter = المسجّل): '; read -r p
+         printf 'تقييد كامل -r؟ (y/N): '; read -r pol
+         printf 'تسجيل كل أمر -w؟ (Y/n): '; read -r w
+         printf 'حارس إغلاق -g؟ (y/N): '; read -r g
+         local args=(open -a "$a" -m "$m" --force)
+         [ -n "$p" ] && args+=(-p "$p")
+         case "$pol" in y|Y) args+=(-r);; esac
+         case "$w" in n|N) ;; *) args+=(-w);; esac
+         case "$g" in y|Y) args+=(-g);; esac
+         cmd_open "${args[@]}"; pause;;
+      2) cmd_list; printf '\nالاسم (أو all): '; read -r a
+         if [ "$a" = all ]; then cmd_close --all --dry-run; printf 'تأكيد الحذف؟ اكتب yes: '; read -r y; [ "$y" = yes ] && cmd_close --all
+         else cmd_close -a "$a" --dry-run; printf 'تأكيد؟ اكتب yes: '; read -r y; [ "$y" = yes ] && cmd_close -a "$a"; fi
+         pause;;
+      3) cmd_status; pause;;
+      4) printf 'الاسم: '; read -r a; cmd_log -a "$a"; pause;;
+      5) cmd_agents; printf '\nإضافة كرسيّ — الاسم (Enter للتجاهل): '; read -r n
+         if [ -n "$n" ]; then printf 'ملف المفتاح العامّ (.pub): '; read -r k
+           printf 'المسار [/]: '; read -r p; cmd_agent_add "$n" --key "$k" -p "${p:-/}"; fi
+         pause;;
+      6) cmd_doctor; pause;;
+      0|q) exit 0;;
+    esac
+  done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  التوجيه
+# ═══════════════════════════════════════════════════════════════════════════
+CMD="${1:-menu}"; shift || true
+case "$CMD" in -h|--help|help) usage; exit 0;; esac
+require_run_dir
+seed_registry
+case "$CMD" in
+  menu) menu;;
+  open) cmd_open "$@";;
+  close) cmd_close "$@";;
+  list|ls) cmd_list;;
+  status) cmd_status "$@";;
+  log|logs) cmd_log "$@";;
+  agents|seats) cmd_agents;;
+  agent-add) cmd_agent_add "$@";;
+  agent-del) cmd_agent_del "$@";;
+  doctor) cmd_doctor;;
+  --status) cmd_status "$@";;
+  --close) cmd_close -a arena "$@";;
+  --audit) cmd_log "$@";;
+  --pubkey) echo "ssh-ed25519 $(agent_field arena 3) zalaf-agent-arena";;
+  -h|--help|help) usage;;
+  *) err "أمر غير معروف: $CMD"; echo; usage; exit 1;;
+esac
